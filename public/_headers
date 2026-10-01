@@ -1,0 +1,23 @@
+# Cloudflare Pages 缓存策略
+#
+# 背景：本站点页面结构（尤其拖拽遮罩的隐藏方式）随版本变化，
+# 若 HTML 被浏览器/CDN 长期缓存，用户会持续拿到旧页面（表现为打开即遮罩）。
+# 这里强制 HTML 不缓存、每次都回源取最新；静态资源（CSS/JS/图片）仍可正常缓存。
+
+/index.html
+  Cache-Control: no-cache
+
+# 其他 .html 页面同样不缓存（本单页应用目前只有 index.html，为未来扩展保留）
+/*.html
+  Cache-Control: no-cache
+
+# CSS/图片一天内免回源（二次打开接近瞬开）。
+# 注意：资源文件名不带内容哈希，不能用 max-age=31536000 immutable——
+# 部署新版后老用户会在缓存期内拿旧代码；1 天是"快"与"及时更新"的平衡点。
+/css/*
+  Cache-Control: public, max-age=86400
+
+# bundle.js 是全部业务逻辑的入口：HTTP 缓存过长会让部署后的浏览器继续跑旧代码
+# （SW 已对 bundle 网络优先 + SW 层缓存兜底离线，这里只需很短的 HTTP 缓存）
+/js/*
+  Cache-Control: public, max-age=60

@@ -1,0 +1,38 @@
+name: CI 测试
+
+# 职责边界：本 workflow 只负责跑测试守门，不做部署。
+# 部署由 Cloudflare Pages 的 Git 集成完成（控制台 Connect to Git，
+# Build command 留空、Build output directory 填 public、Production branch 选 main）。
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: 测试
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 固定 Node 版本：测试依赖（jsdom / @smithy）对运行时敏感，避免上游漂移导致误判
+      - name: 设置 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装测试依赖
+        run: npm ci
+
+      # bundle 是提交进仓库的产物（Pages 部署无构建步骤）：源码改了没重新生成会直接红灯
+      - name: 校验 bundle 新鲜度
+        run: |
+          node tools/build.js
+          git diff --exit-code --stat -- public/js/bundle.js
+
+      # 测试不依赖任何真实 R2 凭证（使用本地 mock S3 server）
+      - name: 运行测试
+        run: npm test

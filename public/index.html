@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>R2 增强管理</title>
+<meta name="description" content="部署后零配置的 Cloudflare R2 文件管理站，连接信息保存在本地浏览器">
+<meta name="theme-color" content="#f5f7fa">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/style.css">
+<!-- 预加载脚本：bundle 由 4 个源文件合并而成（tools/build.js），解析期即开始下载 -->
+<link rel="preload" href="js/bundle.js" as="script">
+<!-- 关键兜底（内联，不依赖外部 CSS 是否被 CDN 缓存）：
+     HTML 的 hidden 属性会被显式 display 声明覆盖（如 .drop-mask { display:flex }），
+     曾导致拖拽遮罩从页面加载起就常驻显示、遮挡整个界面。
+     此规则内联在文档中，无论 style.css 是否命中缓存都会生效。 -->
+<style>
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true"></span>
+      <div class="brand-text">
+        <h1>R2 增强管理</h1>
+        <p id="connStatus" class="conn-status">未连接</p>
+      </div>
+    </div>
+    <!-- 容量组件：桌面端显示在顶栏中部，填补留白；手机端由 mCapStrip 完整展示 -->
+    <div id="capWidget" class="cap-widget" hidden>
+      <div class="cap-text" id="capText">容量统计中…</div>
+      <div class="cap-track"><div id="capFill" class="cap-fill"></div></div>
+    </div>
+    <div class="topbar-actions">
+      <div class="config-switch">
+        <label for="cfgSelect">配置</label>
+        <select id="cfgSelect"></select>
+      </div>
+      <button id="btnNewConfig" class="btn btn-ghost" type="button" title="新建配置（打开空白设置页，保存后新增一条配置）">＋<span class="new-cfg-text"> 新建配置</span></button>
+      <button id="btnSettings" class="btn btn-ghost" type="button">⚙ 设置</button>
+    </div>
+  </header>
+
+  <!-- 配置页 -->
+  <section id="viewConfig" class="view" hidden>
+    <div class="config-wrap">
+      <div class="config-card">
+        <div class="config-head">
+          <button id="btnCfgBack" class="btn btn-ghost" type="button" title="返回文件列表（不保存）" hidden>← 返回</button>
+          <h2 id="cfgTitle">连接配置</h2>
+        </div>
+        <p class="hint">
+          只需部署一次本站点，以下 R2 信息在此填写并保存于<strong>本机浏览器</strong>。
+          令牌请从 Cloudflare 控制台 <code>R2 → 创建 API 令牌</code> 获取。
+        </p>
+
+        <form id="cfgForm" autocomplete="off" novalidate>
+          <div class="field-row">
+            <div class="field">
+              <label>配置名称 <span class="optional">（可选）</span></label>
+              <input type="text" name="name" placeholder="例如：生产桶 / 测试桶">
+            </div>
+          </div>
+
+          <div class="field-grid">
+            <div class="field">
+              <label>访问密钥 ID <em>*</em></label>
+              <input type="text" name="accessKeyId" placeholder="AKIA...">
+            </div>
+            <div class="field">
+              <label>机密访问密钥 <em>*</em></label>
+              <input type="password" name="secretAccessKey" placeholder="仅本机可见">
+            </div>
+            <div class="field span-2">
+              <label>为 S3 客户端使用管辖权地特定的终结点 <em>*</em></label>
+              <input type="text" name="endpoint" placeholder="https://xxx.r2.cloudflarestorage.com">
+            </div>
+            <div class="field">
+              <label>存储桶名称 <em>*</em></label>
+              <input type="text" name="bucket" placeholder="my-bucket">
+            </div>
+            <div class="field">
+              <label>R2 公共开发 URL <span class="optional">（可选）</span></label>
+              <input type="text" name="publicUrl" placeholder="https://pub-xxx.r2.dev">
+            </div>
+            <div class="field span-2">
+              <label>自定义域 <span class="optional">（可选；经 Cloudflare 代理的域名会自动压缩相册缩略图）</span></label>
+              <input type="text" name="customDomain" placeholder="https://your-domain.com">
+            </div>
+            <div class="field">
+              <label>容量上限 <span class="optional">（GB，可选，默认 10）</span></label>
+              <input type="text" name="capacityGB" placeholder="10" inputmode="decimal">
+            </div>
+          </div>
+
+          <div id="cfgErrors" class="cfg-errors" hidden></div>
+
+          <div class="field-row actions">
+            <div class="actions-left">
+              <button type="submit" class="btn btn-primary">保存并连接</button>
+              <button type="button" id="btnTest" class="btn btn-ghost">测试连接</button>
+            </div>
+            <div class="actions-right">
+              <button type="button" id="btnDeleteCfg" class="btn btn-danger-ghost" hidden>删除当前配置</button>
+              <button type="button" id="btnExport" class="btn btn-ghost">导出配置</button>
+              <button type="button" id="btnImport" class="btn btn-ghost">导入配置</button>
+              <button type="button" id="btnPasteImport" class="btn btn-ghost">粘贴导入</button>
+              <button type="button" id="btnClear" class="btn btn-danger-ghost">清除本机配置</button>
+            </div>
+          </div>
+
+          <div id="pasteImport" class="paste-import" hidden>
+            <p class="paste-import-hint">把电脑上「导出配置」得到的 <code>.json</code> 文件内容整体复制粘贴到这里，再点「执行导入」。</p>
+            <textarea id="pasteImportText" rows="6" placeholder='粘贴导出的 JSON 内容，形如 { "_type": "R2EnhancedManager", "version": 1, "configs": [...] }' spellcheck="false"></textarea>
+            <div class="paste-import-actions">
+              <button type="button" id="btnPasteGo" class="btn btn-primary">执行导入</button>
+              <button type="button" id="btnPasteCancel" class="btn btn-ghost">取消</button>
+            </div>
+          </div>
+        </form>
+
+        <div class="cors-note">
+          <strong>连接失败？</strong>最常见原因是存储桶 CORS 未配置或配置有误。
+          请到 Cloudflare 控制台 → R2 → 你的桶 → Settings → Public bucket access → CORS，
+          按下面这段配置（把 <code>AllowedOrigins</code> 换成你当前访问本站的域名，
+          <strong>不要带结尾斜杠</strong>，且必须包含 <code>AllowedHeaders: ["*"]</code>）：
+          <pre class="cors-json">[
+  {
+    "AllowedOrigins": ["<span id="originHere">（当前站点域名）</span>"],
+    "AllowedMethods": ["GET", "HEAD", "PUT", "POST", "DELETE"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }
+]</pre>
+        <p class="hint" style="margin-top:8px">其中 <code>ExposeHeaders: ["ETag"]</code> 用于大文件分片上传（浏览器需要读到每个分片的 ETag 才能合并；缺失时自动降级为整包上传）。</p>
+        </div>
+
+        <div class="env-check">
+          <button type="button" id="btnEnvCheck" class="btn btn-ghost">运行环境自检（手机连接问题排查）</button>
+          <div id="envCheckResult" class="env-check-result" hidden></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 文件管理页 -->
+  <section id="viewFiles" class="view" hidden>
+    <!-- 手机容量条：完整展示桶名与用量，不再被顶栏截断 -->
+    <div id="mCapStrip" class="m-cap-strip m-only" hidden>
+      <span id="mCapDot" class="m-cap-dot"></span>
+      <span id="mCapText" class="m-cap-text"></span>
+      <div class="m-cap-track"><div id="mCapFill" class="cap-fill"></div></div>
+    </div>
+
+    <!-- 分区 Tab：全部 / 相册 / 视频 / 文档 / 音频 -->
+    <div class="sections-bar">
+      <div class="sections">
+        <button type="button" class="section-tab active" data-section="all">全部</button>
+        <button type="button" class="section-tab" data-section="images">🖼 相册</button>
+        <button type="button" class="section-tab" data-section="videos">🎬 视频</button>
+        <button type="button" class="section-tab" data-section="docs">📄 文档</button>
+        <button type="button" class="section-tab" data-section="audios">🎵 音频</button>
+      </div>
+      <div class="view-toggle">
+        <button type="button" id="btnViewGrid" class="btn btn-icon" title="网格视图">▦</button>
+        <button type="button" id="btnViewList" class="btn btn-icon" title="列表视图">☰</button>
+      </div>
+    </div>
+
+    <!-- 路径 + 工具行：桌面一行放下（路径在新建文件夹旁），手机由 CSS 重排为多行 -->
+    <div class="file-top">
+      <nav id="breadcrumb" class="breadcrumb"></nav>
+      <div class="toolbar-left">
+        <label class="btn btn-primary upload-btn">
+          上传文件
+          <input id="fileInput" type="file" multiple hidden>
+        </label>
+        <label class="btn upload-btn">
+          上传文件夹
+          <input id="folderInput" type="file" webkitdirectory multiple hidden>
+        </label>
+        <button id="btnMkdir" class="btn" type="button">＋ 新建文件夹</button>
+      </div>
+      <div class="crumb-actions">
+        <button id="mViewToggle" class="btn btn-icon m-only" title="切换视图" type="button" hidden>▦</button>
+        <button id="mSearchBtn" class="btn btn-icon m-only" title="搜索" type="button">🔍</button>
+        <input id="searchInput" type="search" placeholder="搜索当前目录…" autocomplete="off">
+        <button id="btnRefresh" class="btn btn-icon" title="刷新" type="button">⟳</button>
+      </div>
+      <!-- 批量操作栏（勾选后出现，桌面端） -->
+      <div class="toolbar-right" id="batchBar" style="display:none">
+        <span id="selInfo" class="sel-info">已选 0 项</span>
+        <button id="btnDownloadSel" class="btn" type="button">下载</button>
+        <button id="btnCopyLinkSel" class="btn" type="button">复制公开链接</button>
+        <button id="btnMoveSel" class="btn" type="button">移动</button>
+        <button id="btnDeleteSel" class="btn btn-danger" type="button">删除</button>
+      </div>
+      <!-- 手机搜索行：点 🔍 展开，不常驻占位 -->
+      <div id="mSearchRow" class="m-search-row m-only" hidden>
+        <input id="mSearchInput" type="search" placeholder="搜索当前目录…" autocomplete="off">
+        <button id="mSearchCancel" class="btn btn-icon" title="关闭" type="button">✕</button>
+      </div>
+    </div>
+
+    <!-- 文件表格 -->
+    <div class="table-wrap" id="tableWrap">
+      <table class="file-table">
+        <thead>
+          <tr>
+            <th class="col-check"><input id="checkAll" type="checkbox"></th>
+            <th class="col-name">名称</th>
+            <th class="col-size">大小</th>
+            <th class="col-date">修改时间</th>
+            <th class="col-act">操作</th>
+          </tr>
+        </thead>
+        <tbody id="fileBody">
+          <tr class="empty-row"><td colspan="5">加载中…</td></tr>
+        </tbody>
+      </table>
+      <!-- 网格视图容器（分区展示用，列表模式下隐藏） -->
+      <div id="gridBody" class="grid-body" style="display:none"></div>
+    </div>
+
+    <div id="emptyState" class="empty-state" hidden>
+      <div class="empty-icon">📂</div>
+      <p>此文件夹为空</p>
+      <p class="muted">拖动文件到此处，或点击「上传文件」</p>
+    </div>
+
+    <!-- 手机底部操作栏：默认「选择 / 上传 / 新建」，多选模式切换为批量操作 -->
+    <div id="mBottomBar" class="m-bottombar m-only">
+      <div id="mBarDefault" class="m-bar-row">
+        <button id="mBtnSelect" class="btn" type="button">☰ 选择</button>
+        <button id="mBtnUpload" class="btn btn-primary" type="button">＋ 上传</button>
+        <button id="mBtnMkdir" class="btn" type="button">📁 新建</button>
+      </div>
+      <div id="mBarBatch" class="m-bar-row" style="display:none">
+        <span id="mSelInfo" class="m-sel-info">已选 0</span>
+        <button id="mBtnSelectAll" class="btn" type="button">全选</button>
+        <button id="mBtnDownload" class="btn" type="button">下载</button>
+        <button id="mBtnMove" class="btn" type="button">移动</button>
+        <button id="mBtnDelete" class="btn btn-danger" type="button">删除</button>
+        <button id="mBtnCancel" class="btn" type="button">✕</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 移动到文件夹选择器（桌面居中弹窗 / 手机底部弹层） -->
+  <div id="moveModal" class="move-modal" style="display:none">
+    <div class="move-box">
+      <div class="move-head">
+        <span id="moveTitle" class="move-title">移动到…</span>
+        <button id="moveClose" class="btn btn-icon" type="button">✕</button>
+      </div>
+      <nav id="moveCrumb" class="move-crumb"></nav>
+      <div id="moveFolders" class="move-folders"></div>
+      <div class="move-foot">
+        <span id="moveHint" class="move-hint"></span>
+        <button id="moveCancel" class="btn" type="button">取消</button>
+        <button id="moveGo" class="btn btn-primary" type="button">移到此处</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 手机底部动作面板：长按文件 / 点 ⋯ 弹出，也用于「上传」选项 -->
+  <div id="mSheet" class="m-sheet m-only" style="display:none">
+    <div class="m-sheet-backdrop" data-sheet-close></div>
+    <div class="m-sheet-panel">
+      <div id="mSheetTitle" class="m-sheet-title"></div>
+      <div id="mSheetActions" class="m-sheet-actions"></div>
+    </div>
+  </div>
+
+  <!-- 预览模态框：内联 style="display:none" 最高优先级，防止被旧 CSS 覆盖导致常显 -->
+  <div id="previewModal" class="preview-modal" style="display:none">
+    <div class="preview-box">
+      <div class="preview-head">
+        <span id="previewTitle" class="preview-title"></span>
+        <button id="previewClose" class="btn btn-icon" type="button">✕</button>
+      </div>
+      <div id="previewBody" class="preview-body"></div>
+    </div>
+  </div>
+
+  <!-- 拖拽遮罩：内联 style="display:none" 是最高优先级，任何 CSS 规则（含被缓存的旧样式）
+       都无法覆盖它，从根源上杜绝"打开即遮罩"。JS 通过 style.display 控制显示/隐藏。 -->
+  <div id="dropMask" class="drop-mask" style="display:none">
+    <div class="drop-inner">松手上传到当前目录</div>
+  </div>
+
+  <!-- 轻提示 -->
+  <div id="toast" class="toast" hidden></div>
+
+  <!-- 进度条：标题一行（文件名/状态），百分数与计数另起一行，条宽即真实进度 -->
+  <div id="progress" class="progress" hidden>
+    <div id="progressBar" class="progress-bar"></div>
+    <div id="progressPanel" class="progress-panel">
+      <div id="progressTitle" class="progress-title"></div>
+      <div id="progressSub" class="progress-sub"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- bundle.js = sigv4 + s3 + config + app 按依赖顺序合并（tools/build.js 生成） -->
+<script defer src="js/bundle.js"></script>
+<!-- Service Worker：静态资源 SWR 缓存（仅 https/localhost 生效；非安全上下文自动跳过） -->
+<script>
+if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+  addEventListener('load', function () {
+    navigator.serviceWorker.register('sw.js').catch(function () { /* 注册失败不影响功能 */ });
+  });
+}
+</script>
+</body>
+</html>

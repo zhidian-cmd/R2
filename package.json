@@ -1,0 +1,23 @@
+{
+  "name": "r2-enhanced-manager",
+  "version": "1.0.0",
+  "description": "R2 增强管理 - 部署后零配置的 Cloudflare R2 文件管理站（配置在网页内填写，纯静态，浏览器直连 S3 API）",
+  "type": "commonjs",
+  "scripts": {
+    "test": "node --test --test-timeout=15000 --test-force-exit --experimental-test-isolation=none tests/sigv4.test.js tests/s3-integration.test.js tests/browser-smoke.test.js tests/diagnose.test.js tests/upload-signature.test.js",
+    "dev": "npx wrangler pages dev public --port 8788",
+    "deploy": "npx wrangler pages deploy public"
+  },
+  "keywords": [
+    "cloudflare",
+    "r2",
+    "s3",
+    "pages",
+    "file-manager"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "jsdom": "^30.0.1",
+    "xhr2": "^0.2.1"
+  }
+}
