@@ -132,6 +132,14 @@
     return String(value).trim().replace(/\s+/g, ' ');
   }
 
+  /** HMAC 密钥推导链（AWS 规范四步），sign 与 presign 共用。返回 kSigning 的 hex */
+  async function deriveSigningKey(secretAccessKey, dateStamp, region, service) {
+    var kDate = await hmac('AWS4' + secretAccessKey, dateStamp);
+    var kRegion = await hmac(hexToBytes(kDate), region);
+    var kService = await hmac(hexToBytes(kRegion), service);
+    return hmac(hexToBytes(kService), 'aws4_request');
+  }
+
   /**
    * 计算签名并返回 Authorization header 值。
    *
@@ -199,10 +207,7 @@
     ].join('\n');
 
     // HMAC 密钥链
-    var kDate = await hmac('AWS4' + secretAccessKey, dateStamp);
-    var kRegion = await hmac(hexToBytes(kDate), region);
-    var kService = await hmac(hexToBytes(kRegion), service);
-    var kSigning = await hmac(hexToBytes(kService), 'aws4_request');
+    var kSigning = await deriveSigningKey(secretAccessKey, dateStamp, region, service);
     var signature = await hmac(hexToBytes(kSigning), stringToSign);
 
     var authorization = 'AWS4-HMAC-SHA256 Credential=' + accessKeyId + '/' + scope +
@@ -296,10 +301,7 @@
       await sha256Hex(canonicalRequest)
     ].join('\n');
 
-    var kDate = await hmac('AWS4' + secretAccessKey, dateStamp);
-    var kRegion = await hmac(hexToBytes(kDate), region);
-    var kService = await hmac(hexToBytes(kRegion), service);
-    var kSigning = await hmac(hexToBytes(kService), 'aws4_request');
+    var kSigning = await deriveSigningKey(secretAccessKey, dateStamp, region, service);
     var signature = await hmac(hexToBytes(kSigning), stringToSign);
 
     // 拼接路径与签名请求中的 canonicalUri 保持同一形式，杜绝未来改动引入不一致
@@ -2704,23 +2706,11 @@
     updateConnStatus('err', '连接错误');
   }
 
-  var DEBUG_PERF = /[?&]debug=1/.test(location.search);
-  function perfMark(name) { if (DEBUG_PERF && performance.mark) performance.mark(name); }
-  function perfMeasure(name, startMark, endMark) {
-    if (!DEBUG_PERF || !performance.measure) return;
-    try {
-      performance.measure(name, startMark, endMark);
-      var e = performance.getEntriesByName(name).pop();
-      console.log('[perf]', name, Math.round(e.duration) + 'ms');
-    } catch (err) { /* ignore */ }
-  }
-
   async function loadDir(opts) {
     if (!s3) return;
     opts = opts || {};
     var seq = ++loadSeq;
     var dir = currentDir;
-    perfMark('loadDir-start');
     selected.clear();
     updateSelBar();
 
@@ -2791,8 +2781,6 @@
     bumpItemsVersion();
     renderBreadcrumb();
     renderTable();
-    perfMark('loadDir-firstScreen-done');
-    perfMeasure('loadDir:firstScreen', 'loadDir-start', 'loadDir-firstScreen-done');
     prefetchChildDirs(dir, items.filter(function (i) { return i.isFolder; }));
 
     if (!first.truncated || !first.nextContinuationToken) {

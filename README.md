@@ -163,10 +163,6 @@ node tools/diagnose.js --config r2-config.json
 
 调试时可强制指定布局：`https://站点地址/?layout=mobile` 或 `?layout=desktop`。
 
-本地预览 / 演示可运行 `node tools/dev-mock.js`（静态站点 + 带 CORS 的 mock S3，预置演示文件），
-打开 <http://127.0.0.1:8788>，配置 Endpoint 填 `http://127.0.0.1:9999`、Bucket 填 `test-bucket`、
-公共开发 URL 填 `http://127.0.0.1:9999/test-bucket` 即可体验完整界面。
-
 ### 关于「文件夹」
 
 S3 / R2 没有真正的目录概念，文件夹只是 **key 以 `/` 结尾的 0 字节占位对象**。

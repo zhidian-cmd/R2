@@ -1259,23 +1259,11 @@
     updateConnStatus('err', '连接错误');
   }
 
-  var DEBUG_PERF = /[?&]debug=1/.test(location.search);
-  function perfMark(name) { if (DEBUG_PERF && performance.mark) performance.mark(name); }
-  function perfMeasure(name, startMark, endMark) {
-    if (!DEBUG_PERF || !performance.measure) return;
-    try {
-      performance.measure(name, startMark, endMark);
-      var e = performance.getEntriesByName(name).pop();
-      console.log('[perf]', name, Math.round(e.duration) + 'ms');
-    } catch (err) { /* ignore */ }
-  }
-
   async function loadDir(opts) {
     if (!s3) return;
     opts = opts || {};
     var seq = ++loadSeq;
     var dir = currentDir;
-    perfMark('loadDir-start');
     selected.clear();
     updateSelBar();
 
@@ -1346,8 +1334,6 @@
     bumpItemsVersion();
     renderBreadcrumb();
     renderTable();
-    perfMark('loadDir-firstScreen-done');
-    perfMeasure('loadDir:firstScreen', 'loadDir-start', 'loadDir-firstScreen-done');
     prefetchChildDirs(dir, items.filter(function (i) { return i.isFolder; }));
 
     if (!first.truncated || !first.nextContinuationToken) {
