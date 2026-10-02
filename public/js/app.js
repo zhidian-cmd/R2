@@ -293,11 +293,18 @@
       EL.capFill.style.width = pct + '%';
       EL.capFill.classList.toggle('over', !!over);
       if (used == null) {
-        // 统计中：已扫出部分对象数时实时显示进度，避免大桶长时间"干等"没有反馈
-        var n = usage.progressCount;
-        EL.capText.textContent = scanning
-          ? (n ? '容量统计中… 已扫 ' + n.toLocaleString() + ' 个对象' : '容量统计中…')
-          : '容量未统计 · 点击重试';
+        // 三态文案：读取记录（进站/切桶的快路径）→ 扫描（区分手动/自动）→ 未统计。
+        // 让用户始终知道系统在干什么，而不是对着一句笼统的"统计中"干等
+        if (usage.reading) {
+          EL.capText.textContent = '读取容量记录…';
+        } else if (scanning) {
+          // 扫描中：已扫出部分对象数时实时显示进度，避免大桶长时间"干等"没有反馈
+          var n = usage.progressCount;
+          var verb = usage.scanSource === 'manual' ? '手动统计容量' : '容量统计中';
+          EL.capText.textContent = n ? verb + '… 已扫 ' + n.toLocaleString() + ' 个对象' : verb + '…';
+        } else {
+          EL.capText.textContent = '容量未统计 · 点击重试';
+        }
       } else {
         EL.capText.textContent = '已用 ' + usedStr + ' / ' + limit + ' GB';
       }
@@ -319,10 +326,12 @@
       if (used != null) {
         txt += ' · ' + usedStr + ' / ' + limit + ' GB';
         state = over ? 'err' : 'on';
+      } else if (usage.reading) {
+        txt += ' · 读取容量记录…';
       } else {
         var pn = usage.progressCount;
         txt += scanning
-          ? (pn ? ' · 统计中 ' + pn.toLocaleString() : ' · 容量统计中…')
+          ? (pn ? ' · 统计中 ' + pn.toLocaleString() : ' · ' + (usage.scanSource === 'manual' ? '手动统计容量…' : '容量统计中…'))
           : ' · 容量未统计';
       }
     }
@@ -398,17 +407,24 @@
         renderUsageText();
       } else {
         resetUsage();
+        usage.reading = true; // 容量条先显示「读取容量记录…」，记录到达（或判定无记录）后切换
         renderUsageText();
         // 本会话无数字：读 R2 上的持久容量记录。命中则立即秒显（免全量扫描），
         // 未命中（新桶/记录丢失或损坏）才回退到全量扫描——扫完会写回建立记录
         readUsageRecord().then(function (rec) {
-          if (!activeConfig || activeConfig.id !== config.id) return; // 已切走
+          if (!activeConfig || activeConfig.id !== config.id) return; // 已切走（新桶自会管理自己的 reading）
           if (!rec) {
-            // 无记录：自动全量扫描建立基线并写回（自愈路径）
+            // 无记录：自动全量扫描建立基线并写回（自愈路径，仅首次/记录丢失时发生）
+            usage.reading = false;
+            renderUsageText();
             if (!(usage.id === config.id && usage.scannedAt)) scanUsage();
             return;
           }
-          if (usage.id === config.id && usage.scannedAt) return; // 期间已有可信数字（手动扫描接管）
+          if (usage.id === config.id && usage.scannedAt) { // 期间已有可信数字（手动扫描接管）
+            usage.reading = false;
+            renderUsageText();
+            return;
+          }
           usage.id = config.id;
           usage.objectBytes = rec.totalBytes;
           usage.partBytes = 0; // 记录不区分分片占用，扫描校准后恢复精确值
@@ -417,13 +433,17 @@
           usage.uploads = 0;
           usage.scannedAt = rec.updatedAt || Date.now();
           usage.progressCount = null;
+          usage.reading = false;
           usageCache[config.id] = {
             objectBytes: usage.objectBytes, partBytes: usage.partBytes, bytes: usage.bytes,
             objectCount: usage.objectCount, uploads: 0, scannedAt: usage.scannedAt
           };
           renderUsageText();
           alarmIfOverLimit();
-        }).catch(function () { /* ignore */ });
+        }).catch(function () {
+          usage.reading = false; // 理论上 readUsageRecord 不 reject，保险起见不卡住状态条
+          renderUsageText();
+        });
       }
     }
   }
@@ -800,6 +820,8 @@
     scannedAt: 0,    // 上次扫描完成时间（0 = 本会话尚未拿到该配置的统计结果）
     scan: null,      // 进行中的扫描 Promise
     scanId: null,    // 进行中的扫描所属配置
+    scanSource: null, // 进行中扫描的来源：'manual'（手动点容量条）/ 'auto'（自愈/校准）——文案区分用
+    reading: false,  // 正在读取 _meta/usage.json 持久记录（进站/切桶秒显前的过渡状态）
     progressCount: null // 进行中扫描的已列举对象数（实时进度显示用；非扫描期为 null）
   };
 
@@ -871,6 +893,8 @@
     usage.objectCount = usage.uploads = 0;
     usage.scannedAt = 0;
     usage.progressCount = null;
+    usage.scanSource = null;
+    usage.reading = false;
   }
 
   /** 当前内存里的用量是否属于当前配置且已完成过一次扫描（唯一可采信的条件） */
@@ -915,9 +939,11 @@
    * 瞬时错误（网络层/超时/5xx）自动重试一次——大桶要翻很多页，串行翻页途中
    * 单个请求抖动不应让整个统计报废（否则容量条长期停在"未统计"，像消失了一样）。
    * 扫描过程中实时上报已列举对象数，界面显示"统计中… 已扫 N 个对象"。
+   * @param {string} [source] 扫描来源：'manual'（手动点容量条）/'auto'（自愈、失败校准）。
+   *                          仅影响容量条文案（「手动统计容量…」vs「容量统计中…」）
    * @returns {Promise<number|null>} 扫描得到的字节数；失败或配置已切换返回 null
    */
-  function scanUsage() {
+  function scanUsage(source) {
     if (!s3 || !activeConfig) return Promise.resolve(null);
     var id = activeConfig.id;
     if (usage.scan && usage.scanId === id) return usage.scan; // 复用进行中的扫描
@@ -926,6 +952,7 @@
     usageAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     var signal = usageAbort ? usageAbort.signal : null;
     usage.scanId = id;
+    usage.scanSource = (source === 'manual') ? 'manual' : 'auto';
     usage.progressCount = null;
     renderUsageText(); // 立即渲染「统计中…」
     var task = withRetry(function () {
@@ -942,7 +969,7 @@
     }).then(function (res) {
       // 只在「本次扫描仍是当前扫描」时解除占用：切换配置后新扫描已接管状态，
       // 旧回调无权清空，否则容量条会卡在未统计状态
-      if (usage.scanId === id) { usage.scan = null; usage.scanId = null; usage.progressCount = null; }
+      if (usage.scanId === id) { usage.scan = null; usage.scanId = null; usage.scanSource = null; usage.progressCount = null; }
       // 扫描期间用户切换了配置：结果丢弃（避免串台），由新配置的扫描负责渲染
       if (!activeConfig || activeConfig.id !== id) return null;
       usage.id = id;
@@ -964,7 +991,7 @@
     }).catch(function (err) {
       // 主动取消（切换配置触发 abort）：静默退出，状态已由新扫描接管
       if (err && (err.code === 'Aborted' || err.name === 'AbortError')) return null;
-      if (usage.scanId === id) { usage.scan = null; usage.scanId = null; usage.progressCount = null; }
+      if (usage.scanId === id) { usage.scan = null; usage.scanId = null; usage.scanSource = null; usage.progressCount = null; }
       // 扫描期间已切换配置：本次失败与当前视图无关，不提示也不重渲染
       if (activeConfig && activeConfig.id === id) {
         renderUsageText();
@@ -995,7 +1022,7 @@
     if (el && activeConfig) {
       el.title = usageReady()
         ? '已用 ' + usageLabel(usage.bytes) + ' / 上限 ' + capacityLimitGB() + ' GB（' + activeConfig.bucket + '）'
-        : activeConfig.bucket + ' · 容量统计中…';
+        : activeConfig.bucket + ' · ' + (usage.reading ? '读取容量记录…' : '容量统计中…');
     }
   }
 
@@ -2044,8 +2071,9 @@
   window.addEventListener('online', function () {
     toast('网络已恢复', 'ok');
     if (s3 && activeConfig && !$('viewFiles').hidden) {
+      // 只刷新目录列表。容量不做自动重扫：增量维护仍然连续可信，
+      // 怀疑断网期间有别的设备改过桶，手动点容量条校准即可
       loadDir({ bypass: true });
-      scanUsage(); // 断网期间的用量变化无法感知，恢复后重新全量扫描
     }
   });
 
@@ -3168,16 +3196,17 @@
     applySearch('');
   });
 
-  // 点容量条手动重新全量扫描（本会话内唯一的刷新入口，无任何缓存判定）
+  // 点容量条手动重新全量扫描（本会话内唯一的刷新入口，无任何缓存判定）：
+  // 扫完把结果创建/覆盖到 _meta/usage.json，之后进站就显示这份记录
   $('mCapStrip').addEventListener('click', function () {
     if (!s3 || !activeConfig) return;
-    toast('正在重新统计容量…');
-    scanUsage();
+    toast('手动统计容量中…');
+    scanUsage('manual');
   });
   $('capWidget').addEventListener('click', function () {
     if (!s3 || !activeConfig) return;
-    toast('正在重新统计容量…');
-    scanUsage();
+    toast('手动统计容量中…');
+    scanUsage('manual');
   });
 
   // ---------- 绑定 UI 事件 ----------
