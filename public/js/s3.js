@@ -363,7 +363,14 @@
 
     var res = await this.request('GET', url, null, null, null, { signal: opts.signal });
     var xml = await res.response.text();
-    return parseListing(xml);
+    var page = parseListing(xml);
+    // 站内保留目录 _meta/ 对所有业务场景不可见（容量记录等自维护文件存放处）：
+    // 在 list 出口统一过滤，文件列表/容量统计/文件夹索引/搜索全部自动干净，
+    // 也保证统计值不含记录自身（记录里存的 totalBytes 与扫描值口径一致）
+    page.items = (page.items || []).filter(function (i) {
+      return !(i.name && String(i.name).indexOf('_meta/') === 0);
+    });
+    return page;
   };
 
   /**

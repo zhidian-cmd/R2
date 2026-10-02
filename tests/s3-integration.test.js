@@ -123,6 +123,41 @@ test('S3 客户端端到端：上传 / 列举 / HEAD / 下载 / 复制 / 建目�
     assert.deepStrictEqual(all.map(x => x.name).sort(), ['pg/p0.txt', 'pg/p1.txt', 'pg/p2.txt']);
   });
 
+  await t.test('list 出口统一过滤站内保留目录 _meta/', async () => {
+    // 造一个业务对象 + 容量记录 + 折叠形态的 _meta/ 前缀，列表/递归统计都不得出现
+    await s3.put('biz/data.txt', new Uint8Array([9]), { filename: 'data.txt' });
+    await s3.put('_meta/usage.json', new TextEncoder().encode('{"v":1,"totalBytes":1,"objectCount":1,"updatedAt":0}'));
+    await s3.put('_meta/other.bin', new Uint8Array([1, 2])); // 记录不止一个时同样全部过滤
+
+    const page = await s3.list({ prefix: '' });
+    assert.ok(page.items.length > 0);
+    assert.strictEqual(page.items.some(i => String(i.name).indexOf('_meta/') === 0), false,
+      '折叠列表不应出现 _meta/ 前缀条目');
+    assert.ok(page.items.find(i => i.name === 'biz/'));
+
+    // 递归模式（容量统计路径，delimiter=null）同样过滤
+    const flat = await s3.list({ prefix: '', delimiter: null });
+    assert.strictEqual(flat.items.some(i => String(i.name).indexOf('_meta/') === 0), false,
+      '递归列表不应出现 _meta/ 前缀条目');
+    assert.ok(flat.items.find(i => i.name === 'biz/data.txt'));
+    assert.ok(flat.items.find(i => i.name === 'a.txt'));
+  });
+
+  await t.test('容量记录 put/get 往返（_meta/usage.json）', async () => {
+    const rec = { v: 1, totalBytes: 7 * 1024 * 1024 * 1024, objectCount: 36, updatedAt: 1700000000000 };
+    await s3.put('_meta/usage.json', new TextEncoder().encode(JSON.stringify(rec)));
+    const res = await s3.get('_meta/usage.json');
+    assert.ok(res.blob, 'GET 应回传 blob（app.js 经 blob.text() 解析记录）');
+    const raw = mock.store.get('_meta/usage.json').data;
+    const back = JSON.parse(new TextDecoder().decode(raw));
+    assert.strictEqual(back.v, 1);
+    assert.strictEqual(back.totalBytes, rec.totalBytes);
+    assert.strictEqual(back.objectCount, rec.objectCount);
+    assert.strictEqual(back.updatedAt, rec.updatedAt);
+    // 字段恒定：序列化后字节数有硬上限（~150B），杜绝记录随时间膨胀
+    assert.ok(JSON.stringify(back).length <= 200, '记录体积必须恒定，不得增长');
+  });
+
   await t.test('size / lastModified 字段完整', async () => {
     const page = await s3.list({ prefix: '' });
     const hello = page.items.find(i => i.name === 'a.txt');

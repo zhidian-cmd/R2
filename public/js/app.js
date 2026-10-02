@@ -382,8 +382,9 @@
       loadDir();
       // 终止上一个桶还在跑的后台扫描：省带宽，避免新旧两份扫描抢连接拖慢浏览/预览
       if (usageAbort) { try { usageAbort.abort(); } catch (e) { /* ignore */ } usageAbort = null; }
-      // 容量：从按桶缓存恢复本会话已扫出的数字（切走再切回不再"消失"），
-      // 没有记录才清零；随后每次都后台重新全量扫描校准，完成后原位更新数字
+      // 容量：从按桶缓存恢复本会话已扫出的数字（切走再切回不再"消失"）。
+      // 会话内有可信数字（本次扫描结果 + 此后一直增量维护）就不再重复全量扫描——
+      // 这是"进站/切桶变快"的关键；校准靠手动点容量条（扫完写回 R2 记录）。
       var cached = usageCache[config.id];
       if (cached) {
         usage.id = config.id;
@@ -394,11 +395,36 @@
         usage.uploads = cached.uploads;
         usage.scannedAt = cached.scannedAt;
         usage.progressCount = null;
+        renderUsageText();
       } else {
         resetUsage();
+        renderUsageText();
+        // 本会话无数字：读 R2 上的持久容量记录。命中则立即秒显（免全量扫描），
+        // 未命中（新桶/记录丢失或损坏）才回退到全量扫描——扫完会写回建立记录
+        readUsageRecord().then(function (rec) {
+          if (!activeConfig || activeConfig.id !== config.id) return; // 已切走
+          if (!rec) {
+            // 无记录：自动全量扫描建立基线并写回（自愈路径）
+            if (!(usage.id === config.id && usage.scannedAt)) scanUsage();
+            return;
+          }
+          if (usage.id === config.id && usage.scannedAt) return; // 期间已有可信数字（手动扫描接管）
+          usage.id = config.id;
+          usage.objectBytes = rec.totalBytes;
+          usage.partBytes = 0; // 记录不区分分片占用，扫描校准后恢复精确值
+          usage.bytes = rec.totalBytes;
+          usage.objectCount = rec.objectCount;
+          usage.uploads = 0;
+          usage.scannedAt = rec.updatedAt || Date.now();
+          usage.progressCount = null;
+          usageCache[config.id] = {
+            objectBytes: usage.objectBytes, partBytes: usage.partBytes, bytes: usage.bytes,
+            objectCount: usage.objectCount, uploads: 0, scannedAt: usage.scannedAt
+          };
+          renderUsageText();
+          alarmIfOverLimit();
+        }).catch(function () { /* ignore */ });
       }
-      renderUsageText();
-      scanUsage();
     }
   }
 
@@ -782,6 +808,51 @@
    *  同时后台重新扫描校准，完成后原位更新。 */
   var usageCache = {};
 
+  // ---------- 桶内持久容量记录（_meta/usage.json） ----------
+  // 每桶一个 ~100 字节、字段恒定不增长的 JSON 记录，用于打开站点/切换桶时秒显容量，
+  // 免去每次进站都全量翻页扫描。字段固定 {v, totalBytes, objectCount, updatedAt}，
+  // 不存历史、不存明细——它只是"上一次校准点"，精度靠增量维护 + 手动扫描校准兜底。
+  var META_KEY = '_meta/usage.json';
+
+  /** 读取 R2 上的容量记录。无记录（首启 404）/ 内容损坏 / 网络失败一律返回 null，
+   *  调用方据此回退全量扫描并重新建立记录（自愈），绝不让坏记录挡住正确数字。 */
+  async function readUsageRecord() {
+    try {
+      var res = await s3.get(META_KEY);
+      var rec = JSON.parse(await res.blob.text());
+      if (rec && rec.v === 1 && isFinite(rec.totalBytes) && rec.totalBytes >= 0 &&
+          isFinite(rec.objectCount) && rec.objectCount >= 0) {
+        return { totalBytes: Number(rec.totalBytes), objectCount: Number(rec.objectCount), updatedAt: Number(rec.updatedAt) || 0 };
+      }
+    } catch (e) { /* ignore：全部走自愈路径 */ }
+    return null;
+  }
+
+  /** 写回容量记录（宽松最后写胜出；失败静默——记录只是加速器，写失败不影响任何功能） */
+  function writeUsageRecord(totalBytes, objectCount) {
+    var rec = { v: 1, totalBytes: Math.max(0, Math.round(totalBytes)), objectCount: Math.max(0, Math.round(objectCount)), updatedAt: Date.now() };
+    try {
+      var body = new Blob([JSON.stringify(rec)], { type: 'application/json' });
+      s3.put(META_KEY, body).catch(function () { /* ignore */ });
+    } catch (e) { /* ignore */ }
+  }
+
+  /** 增量写回去抖：一次批量操作内的多次 usageAdjust 合并成一次 PUT。
+   *  排队期间切换了桶则丢弃（s3 已指向新桶，旧桶写回是错位的）——
+   *  宽松策略：丢一次校准机会没关系，该桶的下一次扫描/写操作会重新写回。 */
+  var usageFlushTimer = null;
+  var usageFlushId = null;
+  function scheduleUsageWrite() {
+    usageFlushId = usage.id;
+    if (usageFlushTimer) clearTimeout(usageFlushTimer);
+    usageFlushTimer = setTimeout(function () {
+      usageFlushTimer = null;
+      if (!s3 || !activeConfig || usageFlushId === null ||
+          activeConfig.id !== usageFlushId || usage.id !== usageFlushId) return;
+      writeUsageRecord(usage.bytes, usage.objectCount);
+    }, 800);
+  }
+
   /** 旧版本遗留在 localStorage 的容量缓存：一次性清除，不再读写 */
   function purgeLegacyUsageStorage() {
     try {
@@ -812,15 +883,26 @@
     return (gb >= 0.01 ? gb.toFixed(2) : '0.00') + ' GB';
   }
 
-  /** 写操作后的容量增量维护：仅在本会话已扫过该配置时生效。
-   *  扫描进行中一律忽略（结果马上会被真实值覆盖，避免把并发窗口算歪）。 */
-  function usageAdjust(deltaBytes) {
-    if (!deltaBytes || !usageReady() || usage.scanId === activeConfig.id) return;
-    usage.bytes = Math.max(0, usage.bytes + deltaBytes);
-    usage.objectBytes = Math.max(0, usage.objectBytes + deltaBytes);
+  /** 写操作后的容量增量维护：仅在本会话已扫过（或已读到记录）该配置时生效。
+   *  扫描进行中一律忽略（结果马上会被真实值覆盖，避免把并发窗口算歪）。
+   *  deltaCount：对象数增减（上传 +N / 删除 -N），用于维护 R2 记录的 objectCount。
+   *  维护后经去抖写回 R2 记录，让其他设备/下次进站也能秒显近似容量。 */
+  function usageAdjust(deltaBytes, deltaCount) {
+    if (!deltaBytes && !deltaCount) return;
+    if (!usageReady() || usage.scanId === activeConfig.id) return;
+    if (deltaBytes) {
+      usage.bytes = Math.max(0, usage.bytes + deltaBytes);
+      usage.objectBytes = Math.max(0, usage.objectBytes + deltaBytes);
+    }
+    if (deltaCount) usage.objectCount = Math.max(0, usage.objectCount + deltaCount);
     var cached = usageCache[usage.id]; // 同步缓存：切走再切回显示的是含本次增量的数字
-    if (cached) { cached.bytes = usage.bytes; cached.objectBytes = usage.objectBytes; }
+    if (cached) {
+      cached.bytes = usage.bytes;
+      cached.objectBytes = usage.objectBytes;
+      cached.objectCount = usage.objectCount;
+    }
     renderUsageText();
+    scheduleUsageWrite();
   }
 
   /** 后台容量扫描的取消句柄：切换配置时终止上一个桶还在跑的扫描，
@@ -875,6 +957,7 @@
         objectBytes: usage.objectBytes, partBytes: usage.partBytes, bytes: usage.bytes,
         objectCount: usage.objectCount, uploads: usage.uploads, scannedAt: usage.scannedAt
       };
+      writeUsageRecord(usage.bytes, usage.objectCount); // 校准写回 R2 记录（覆盖漂移/自愈重建）
       renderUsageText();
       alarmIfOverLimit();
       return usage.bytes;
@@ -2003,6 +2086,14 @@
 
   async function uploadEntries(entries) {
     if (!entries.length) return;
+    // 保护站内保留目录 _meta/（容量记录等自维护文件存放处）：
+    // 上传本地文件夹若恰好含同名目录会覆盖记录，这里一律拦截
+    var blocked = entries.filter(function (e) { return String(e.key || '').indexOf('_meta/') === 0; });
+    if (blocked.length) {
+      entries = entries.filter(function (e) { return String(e.key || '').indexOf('_meta/') !== 0; });
+      toast('已跳过 ' + blocked.length + ' 个保留路径文件（_meta/ 为站点自维护目录）', 'err');
+      if (!entries.length) return;
+    }
     // 容量限制：按桶内真实用量校验（必要时先全量扫描），超出上限禁止上传
     if (!(await checkCapacityForUpload(entries))) return;
     uploadActive = true; // 上传期间拦截意外关闭页面
@@ -2082,7 +2173,7 @@
     } else {
       toast('已上传 ' + entries.length + ' 个文件', 'ok');
     }
-    usageAdjust(succeededBytes); // 即时修正显示数字；有失败项时残留分片只能靠重扫发现
+    usageAdjust(succeededBytes, succeededKeys.length); // 即时修正显示数字并写回 R2 记录；有失败项时残留分片只能靠重扫发现
     if (failed.length) scanUsage(); // 失败场景后台重新全量精算一次，校准碎片占用
     dirCacheInvalidate(currentDir);
     dirBitsInvalidate(currentDir);
@@ -2716,7 +2807,7 @@
         });
       }
       hideProgress();
-      usageAdjust(-removedBytes); // 子树字节数在展开时已知，精确扣减
+      usageAdjust(-removedBytes, -deletedCount); // 子树字节数在展开时已知，精确扣减并写回 R2 记录
       selected.clear();
       if (failed.length) toast('删除完成，失败 ' + failed.length + ' 项：' + baseName(failed[0].key), 'err');
       else toast('已删除 ' + deletedCount + ' 项', 'ok');
