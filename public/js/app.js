@@ -804,11 +804,9 @@
     return (n && n > 0) ? n : 10; // 默认 10GB
   }
 
-  // 容量统计**不做任何持久化缓存**：数字只存在于内存，且每次进入页面（切换配置、
-  // 连接恢复、手动点容量条）都必须重新全量扫描一次。
-  //   为什么删掉缓存：旧实现把用量写进 localStorage，缓存过期/被清/换设备后
-  //   freshForThisConfig 为 false，usedBytes 会被当作 0 直接放行上传，瞬间突破上限。
-  //   内存值缺失时的唯一正确行为是「重新统计」，不是「当作 0」。
+  // 容量统计的持久化由桶内记录 _meta/usage.json 承担（见下方"桶内持久容量记录"），
+  // 这里只存本会话内存值。数字缺失时（新桶/记录丢失）的唯一正确行为是「重新统计」，
+  // 不是「当作 0」——旧实现把用量写 localStorage 且缺失时按 0 放行，会瞬间突破上限。
   // 统计口径含未完成分片上传已占用的容量（见 s3.usageStats）。
   var usage = {
     id: null,        // 该结果属于哪个配置（多账号切换不串台）
@@ -836,16 +834,55 @@
   // 不存历史、不存明细——它只是"上一次校准点"，精度靠增量维护 + 手动扫描校准兜底。
   var META_KEY = '_meta/usage.json';
 
-  /** 读取 R2 上的容量记录。无记录（首启 404）/ 内容损坏 / 网络失败一律返回 null，
-   *  调用方据此回退全量扫描并重新建立记录（自愈），绝不让坏记录挡住正确数字。 */
-  async function readUsageRecord() {
+  /** 解析记录文本 → 结构化数字（严格校验，坏数据一律返回 null 走自愈） */
+  function parseUsageText(text) {
     try {
-      var res = await s3.get(META_KEY);
-      var rec = JSON.parse(await res.blob.text());
+      var rec = JSON.parse(text);
       if (rec && rec.v === 1 && isFinite(rec.totalBytes) && rec.totalBytes >= 0 &&
           isFinite(rec.objectCount) && rec.objectCount >= 0) {
         return { totalBytes: Number(rec.totalBytes), objectCount: Number(rec.objectCount), updatedAt: Number(rec.updatedAt) || 0 };
       }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  /** 当前配置的公共访问基址（自定义域优先，与预览链接的选取规则一致）。没有则空串 */
+  function usagePublicBase(config) {
+    if (!config) return '';
+    var base = String(config.customDomain || config.publicUrl || '').replace(/\/+$/, '');
+    return base && /^https:\/\//.test(base) ? base : '';
+  }
+
+  /** 公共域直链的本会话可用性记忆（config.id -> 'ok' | 'bad'）。
+   *  'bad' 的典型原因：桶未配置允许站点来源的 CORS，浏览器拦截 fetch。
+   *  标记后本会话内不再重试直链，避免每次进站都白费一次无效请求。 */
+  var usageDirectState = {};
+
+  /** 读取 R2 上的容量记录。
+   *  快路径：配了公共访问（自定义域/公共开发 URL）时走 CDN 直链——边缘就近，
+   *  浏览器强缓存命中时零网络延迟；直链不可用（CORS 未配/网络失败）记入
+   *  usageDirectState 并静默回退。注意桶需配置 CORS 允许站点来源，fetch 才能跨域读到。
+   *  慢路径：S3 终结点签名 GET（与原实现一致，兜底永远可用）。
+   *  无记录（404）/ 内容损坏 / 网络失败一律返回 null，调用方据此自愈全量扫描。 */
+  async function readUsageRecord() {
+    var cfgId = activeConfig ? activeConfig.id : '';
+    var base = usagePublicBase(activeConfig);
+    if (base && usageDirectState[cfgId] !== 'bad') {
+      try {
+        var res = await fetch(base + '/' + META_KEY, { cache: 'default' });
+        if (res.status === 404) { usageDirectState[cfgId] = 'ok'; return null; } // 无记录：直链是通的，自愈建立
+        if (res.ok) {
+          usageDirectState[cfgId] = 'ok';
+          return parseUsageText(await res.text()); // 坏数据返回 null 走自愈，但直链本身没问题
+        }
+        usageDirectState[cfgId] = 'bad'; // 403/5xx 等：直链异常，本会话改走终结点
+      } catch (e) {
+        usageDirectState[cfgId] = 'bad'; // 典型：CORS 未配置被浏览器拦截
+      }
+    }
+    try {
+      var r = await s3.get(META_KEY);
+      return parseUsageText(await r.blob.text());
     } catch (e) { /* ignore：全部走自愈路径 */ }
     return null;
   }
