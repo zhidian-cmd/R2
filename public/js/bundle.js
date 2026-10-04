@@ -1726,7 +1726,7 @@
     // 用量只采信本会话实时扫描的结果；未扫完前显示「统计中」，绝不显示 0
     var dataReady = usageReady();
     var scanning = !!(activeConfig && (usage.scanId === activeConfig.id || usage.scan));
-    var used = dataReady ? usage.bytes / (1024 * 1024 * 1024) : null;
+    var used = dataReady ? usage.bytes / GB_BYTES : null;
     var limit = capacityLimitGB();
     var over = used != null && used >= limit;
     var pct = used == null ? 0 : Math.min(100, used / limit * 100);
@@ -2244,6 +2244,10 @@
   }
 
   // ---------- 容量统计与上传限制 ----------
+  // GB 一律按 Cloudflare 计费口径（十进制，1GB = 10^9 字节）：
+  // R2 免费额度的 10GB 就是这个口径，显示与上限校验必须同尺，否则会悄悄超额 7%
+  var GB_BYTES = 1000 * 1000 * 1000;
+
   // 默认总容量上限（GB），用户可在配置表单的 capacityGB 字段调整
   function capacityLimitGB() {
     var v = activeConfig && activeConfig.capacityGB;
@@ -2387,7 +2391,7 @@
   }
 
   function usageLabel(bytes) {
-    var gb = bytes / (1024 * 1024 * 1024);
+    var gb = bytes / GB_BYTES;
     return (gb >= 0.01 ? gb.toFixed(2) : '0.00') + ' GB';
   }
 
@@ -2490,7 +2494,7 @@
   /** 扫描完成后若已超上限，提醒一次（只在该次扫描触发，不重复骚扰） */
   function alarmIfOverLimit() {
     if (!usageReady()) return;
-    var limitBytes = capacityLimitGB() * 1024 * 1024 * 1024;
+    var limitBytes = capacityLimitGB() * GB_BYTES;
     if (usage.bytes > limitBytes) {
       var detail = '已用 ' + usageLabel(usage.bytes) + ' / 上限 ' + capacityLimitGB() + ' GB';
       if (usage.partBytes > 0) {
@@ -2528,9 +2532,9 @@
       toast('上传被拒绝：无法确认当前用量（容量统计未成功）。请检查网络后重试。', 'err');
       return false;
     }
-    var limitBytes = capacityLimitGB() * 1024 * 1024 * 1024;
+    var limitBytes = capacityLimitGB() * GB_BYTES;
     if (usedBytes + addBytes > limitBytes) {
-      var addGB = addBytes / (1024 * 1024 * 1024);
+      var addGB = addBytes / GB_BYTES;
       toast('上传被拒绝：将超出容量上限。当前已用 ' + usageLabel(usedBytes) +
         ' GB，本次需 ' + addGB.toFixed(2) + ' GB，上限 ' + capacityLimitGB() + ' GB。', 'err');
       return false;
